@@ -16,7 +16,7 @@ void on_open(uv_fs_t *req);
 void on_read(uv_fs_t *req);
 void on_write(uv_fs_t *req);
 
-const int N_STREAMS=1;
+const int N_STREAMS=2;
 
 static uv_fs_t open_req;
 //static uv_fs_t read_req;
@@ -49,8 +49,8 @@ private:
 
 namespace {
     const char* PATH = "/tmp/perftest.tmp";
-    const size_t FSIZE = 4*1024*1024*1024l;
-    //const size_t FSIZE = 400*1024*1024l;
+    //const size_t FSIZE = 4*1024*1024*1024l;
+    const size_t FSIZE = 40*1024*1024l;
     const size_t BUFFER_SIZE = 4096;
 
     int create_file() {
@@ -156,6 +156,34 @@ void on_open(uv_fs_t* req) {
     }
 }
 
+void check_file_content() {
+    uv_fs_t open;
+    uv_fs_t rdreq;
+    auto status = uv_fs_open(uv_default_loop(), &open, PATH, O_RDONLY, 0, nullptr);
+    if (status < 0) {
+        std::cout << "Error: " << status << std::endl;
+        return;
+    }
+    std::vector<char> data(BUFFER_SIZE, 0);
+    uv_buf_t buf = uv_buf_init(data.data(), BUFFER_SIZE);
+    for(ssize_t off = 0; off < static_cast<ssize_t>(FSIZE); off += static_cast<ssize_t>(BUFFER_SIZE)) {
+        status = uv_fs_read(uv_default_loop(), &rdreq, static_cast<uv_file>(open.result), &buf, 1, off, nullptr);
+        if (status < 0) {
+            std::cout << "Failure! Read error at " << off << std::endl;
+            return;
+        }
+        ssize_t stride = (off / BUFFER_SIZE) % N_STREAMS;
+        auto ureq = static_cast<Req*>(writes[stride].data);
+        for (size_t i = 0; i < BUFFER_SIZE; i++) {
+            if (ureq->buffer.base[i] != data[i]) {
+                std::cout << "Failure! Mismatch at " << off << std::endl;
+                return;
+            }
+        }
+    }
+    std::cout << "Success" << std::endl;
+}
+
 int main() {
     std::cout << "Creating " << PATH << " file" << std::endl;
     try {
@@ -175,6 +203,7 @@ int main() {
         uv_loop_close(uv_default_loop());
         std::cout << "Done writing " << ((double)FSIZE/1024.0/1024.0) << "MB in "
                   << total.elapsed() << "s" << std::endl;
+        check_file_content();
     } catch (const std::exception& e) {
         std::cout << "error main " << e.what() << std::endl;
     }
