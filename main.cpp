@@ -7,16 +7,217 @@
 #include <cstring>
 #include <time.h>
 
+#include <atomic>
+
 #include <sys/fcntl.h>
 #include <unistd.h>
 #include <sys/uio.h>
 #include <uv.h>
+
+typedef uint8_t  u8;
+typedef int8_t   i8;
+typedef uint16_t u16;
+typedef int16_t  i16;
+typedef uint32_t u32;
+typedef int32_t  i32;
+typedef uint64_t u64;
+typedef int64_t  i64;
+typedef u64 LogicAddr;
+enum aku_Status {
+    AKU_SUCCESS,
+    AKU_ENO_DATA,
+    AKU_EBAD_ARG,
+};
+
+namespace IO {
+
+// Memory block
+
+//! Represents memory block
+class Block {
+    std::vector<u8>           data_;
+    LogicAddr                 addr_;
+
+public:
+    Block(LogicAddr addr, std::vector<u8>&& data);
+
+    const u8* get_data() const;
+
+    size_t get_size() const;
+
+    LogicAddr get_addr() const;
+};
+Block::Block(LogicAddr addr, std::vector<u8>&& data)
+    : data_(std::move(data))
+    , addr_(addr)
+{
+}
+
+const u8* Block::get_data() const {
+    return data_.data();
+}
+
+size_t Block::get_size() const {
+    return data_.size();
+}
+
+LogicAddr Block::get_addr() const {
+    return addr_;
+}
+
+// Future
+
+template<class T>
+struct Event {
+    void set(T value) {
+        // ???
+    }
+};
+
+template <class T>
+struct Future {
+    Event<T> evt_;
+
+    Future(Event<T>& evt) : evt_(evt)
+    {
+    }
+
+};
+
+template <class Arg>
+struct Promise {
+    Event evt_;
+
+    void set_value(Arg val) {
+        std::cout << "set value " << val << std::endl;
+        evt_.set(val);
+    }
+
+    Future<Arg> get_future() {
+        std::cout << "get future " << std::endl;
+        return Future<Arg>(evt_);
+    }
+};
+
+// IO-service
+
+class IOService {
+    uv_loop_t loop_;
+    uv_idle_t idle_;
+    std::atomic_bool stop_;
+
+    static void on_idle(uv_idle_t* idle) {
+        IOService* io = static_cast<IOService*>(idle->data);
+        if (io->stop_) {
+            uv_stop(&io->loop_);
+        }
+    }
+
+public:
+    IOService()
+        : stop_{0}
+    {
+        uv_loop_init(&loop_);
+        uv_idle_init(&loop_, &idle_);
+        uv_idle_start(&idle_, &IOService::on_idle);
+        idle_.data = this;
+        loop_.data = this;
+    }
+
+    void stop() {
+        stop_ = true;
+    }
+
+    uv_loop_t* _get_loop() {
+        return &loop_;
+    }
+
+    void run() {
+        uv_run(&loop_, UV_RUN_DEFAULT);
+    }
+
+    void close() {
+        uv_loop_close(&loop_);
+    }
+};
+
+class File : std::enable_shared_from_this<File> {
+    IOService& io_;
+    uv_fs_t req_;
+    uv_file fd_;
+    Promise<aku_Status> open_promise_;
+
+    static void on_open(uv_fs_t *req) {
+        uv_fs_req_cleanup(req);
+        File* file = static_cast<File*>(req->data);
+        if (req->result < 0) {
+            file->open_promise_.set_value(AKU_EBAD_ARG);  // real error
+        } else {
+            file->fd_ = req->result;
+            file->open_promise_.set_value(AKU_SUCCESS);
+        }
+    }
+
+public:
+    File(IOService& io)
+        : io_(io)
+        , fd_(0)
+    {
+        req_.data = this;
+    }
+
+    Future<aku_Status> open(const char* path, int flags) {
+        uv_fs_open(io_._get_loop(), &req_, path, flags, 0, &File::on_open);
+        return open_promise_.get_future();
+    }
+};
+
+
+
+struct BlockStore {
+
+    virtual ~BlockStore() = default;
+
+    /** Read block from blockstore
+      */
+    //virtual Future<aku_Status, std::shared_ptr<Block>> read_block(LogicAddr addr) = 0;
+
+    /** Add block to blockstore.
+      * @param data Pointer to buffer.
+      * @return Status and block's logic address.
+      */
+    virtual std::tuple<aku_Status, LogicAddr> append_block(u8 const* data) = 0;
+
+    //! Flush all pending changes.
+    virtual void flush() = 0;
+
+    //! Check if addr exists in block-store
+    virtual bool exists(LogicAddr addr) const = 0;
+
+    //! Compute checksum of the input data.
+    virtual u32 checksum(u8 const* begin, size_t size) const = 0;
+};
+
+/* Usage:
+ * auto fs = LocalFileSystem::get_blockstore("path/to/storage");
+ * fs.read_block_async(addr).then([fs] (aku_Status status, std::shared_ptr<Block> block) {
+ *      ...
+ *      std::unique_ptr<Block> wblock;
+ *      ...
+ *      fs.append_block_async(std::move(wblock)).then([] (aku_Status status, LogicAddr addr) {
+ *          ....
+ *          upper_level_node.append(payload);
+ *      });;
+ * });
+ */
+}
 
 void on_open(uv_fs_t *req);
 void on_read(uv_fs_t *req);
 void on_write(uv_fs_t *req);
 
 const int N_STREAMS=2;
+static volatile bool done = false;
 
 static uv_fs_t open_req;
 //static uv_fs_t read_req;
@@ -121,11 +322,12 @@ void on_write(uv_fs_t* req) {
             streams--;
             if (streams == 0) {
                 uv_fs_close(uv_default_loop(), req, static_cast<uv_file>(open_req.result), nullptr);
+                done = true;
             }
             return;
         }
         // Perform next write
-        uv_fs_write(uv_default_loop(),
+        uv_fs_write(req->loop,
                     req,
                     static_cast<uv_file>(open_req.result),
                     &ureq->buffer,
@@ -145,7 +347,7 @@ void on_open(uv_fs_t* req) {
             auto ureq = static_cast<Req*>(writes[i].data);
             auto off = ureq->current_offset;
             ureq->current_offset += ureq->stride;
-            uv_fs_write(uv_default_loop(),
+            uv_fs_write(req->loop,
                         &writes[i],
                         static_cast<uv_file>(open_req.result),
                         &ureq->buffer,
@@ -184,10 +386,19 @@ void check_file_content() {
     std::cout << "Success" << std::endl;
 }
 
+
+void idle_cb(uv_idle_t* idle) {
+    if (done) {
+        std::cout << "stopped" << std::endl;
+        uv_stop(idle->loop);
+    }
+}
+
 int main() {
     std::cout << "Creating " << PATH << " file" << std::endl;
     try {
         init_file();
+        /*
         for (size_t i = 0; i < N_STREAMS; i++) {
             Req* req = new Req();
             req->path = PATH,
@@ -197,13 +408,34 @@ int main() {
             create_buf(&req->buffer);
             writes[i].data = req;
         }
+        uv_loop_t loop;
+        if (uv_loop_init(&loop) < 0) {
+            std::cout << "Can't create loop!" << std::endl;
+        }
+        std::thread th([&]() {
+            uv_idle_t idle;
+            uv_idle_init(&loop, &idle);
+            uv_idle_start(&idle, idle_cb);
+            uv_run(&loop, UV_RUN_DEFAULT);
+            std::cout << "!uv_run exited!" << std::endl;
+            uv_loop_close(&loop);
+        });
         PerfTimer total;
-        uv_fs_open(uv_default_loop(), &open_req, PATH, O_DIRECT|O_RDWR, 0, &on_open);
-        uv_run(uv_default_loop(), UV_RUN_DEFAULT);
-        uv_loop_close(uv_default_loop());
+        int flags = O_DIRECT|O_RDWR;
+        uv_fs_open(&loop, &open_req, PATH, flags, 0, &on_open);
+        th.join();
         std::cout << "Done writing " << ((double)FSIZE/1024.0/1024.0) << "MB in "
                   << total.elapsed() << "s" << std::endl;
         check_file_content();
+        */
+        using namespace IO;
+        IOService io;
+        std::thread th([&]() {
+            io.run();
+        });
+        File file(io);
+        auto future = file.open(PATH, O_RDONLY);
+        th.join();
     } catch (const std::exception& e) {
         std::cout << "error main " << e.what() << std::endl;
     }
