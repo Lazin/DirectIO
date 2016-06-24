@@ -8,6 +8,11 @@
 #include <time.h>
 
 #include <atomic>
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <functional>
+#include <future>
 
 #include <sys/fcntl.h>
 #include <unistd.h>
@@ -67,35 +72,135 @@ LogicAddr Block::get_addr() const {
 
 // Future
 
-template<class T>
-struct Event {
-    void set(T value) {
-        // ???
+template<class ...Args>
+struct TaskWrapper {
+    // Storage for packaged_task
+    struct _ICallable {
+        virtual void call(Args... args) = 0;
+    };
+
+    template<class Fn>
+    struct Callable : _ICallable {
+        Fn fn_;
+
+        Callable(Fn&& f)
+            : fn_(std::move(f))
+        {}
+
+        virtual void call(Args... args) {
+            fn_(args...);
+        }
+    };
+
+    std::unique_ptr<_ICallable> fn_;
+
+    TaskWrapper() {}
+
+    template<class Ret>
+    TaskWrapper(std::packaged_task<Ret(Args...)>&& fn)
+    {
+        auto ptr = new Callable<std::packaged_task<Ret(Args...)>>(std::move(fn));
+        fn_.reset(ptr);
+    }
+
+    template<class Ret>
+    TaskWrapper& operator = (std::packaged_task<Ret(Args...)>&& fn) {
+        this->~TaskWrapper();
+        new (this) TaskWrapper(std::move(fn));
+        return *this;
+    }
+
+    void operator () (Args... args) const {
+        fn_->call(args...);
     }
 };
 
-template <class T>
-struct Future {
-    Event<T> evt_;
+template<class ...T>
+struct FutureState {
+    bool initialized_;
+    std::tuple<T...> tuple_;
+    TaskWrapper<T...> continuation_;
 
-    Future(Event<T>& evt) : evt_(evt)
+    FutureState()
+        : initialized_(false)
     {
     }
 
-};
-
-template <class Arg>
-struct Promise {
-    Event evt_;
-
-    void set_value(Arg val) {
-        std::cout << "set value " << val << std::endl;
-        evt_.set(val);
+    void set(T... values) {
+        if (!initialized_) {
+            tuple_ = std::make_tuple(values...);
+            initialized_ = true;
+        } else {
+            std::cout << "term1" << std::endl;
+            std::terminate();
+        }
     }
 
-    Future<Arg> get_future() {
-        std::cout << "get future " << std::endl;
-        return Future<Arg>(evt_);
+    std::tuple<T...> get_values() const {
+        return tuple_;
+    }
+
+    template<class Fn>
+    void register_continuation(Fn const& f) {
+        continuation_ = f;
+    }
+
+    void call() {
+        if (initialized_ && continuation_) {
+            call_func(continuation_, std::index_sequence_for<T...>{});
+        } else {
+            std::cout << "term2" << std::endl;
+            std::terminate();
+        }
+    }
+
+    bool conditional_call() {
+        if (initialized_) {
+            call_func(continuation_, std::index_sequence_for<T...>{});
+            return true;
+        }
+        return false;
+    }
+
+private:
+    template<class Func, std::size_t ...I>
+    void call_func(Func const& func, std::index_sequence<I...>)
+    {
+        func(std::get<I>(tuple_)...);
+    }
+};
+
+template <class ...T>
+struct Future {
+    FutureState<T...> &state_;
+
+    Future(FutureState<T...>& state) : state_(state)
+    {
+    }
+
+    template<class Fn>
+    Future<T...>& then(Fn const& f) {
+        state_.register_continuation(f);
+        return *this;
+    }
+
+};
+
+template <class ...Arg>
+struct Promise {
+    FutureState<Arg...> state_;
+
+    void set_value(Arg... values) {
+        state_.set(values...);
+        make_ready();
+    }
+
+    Future<Arg...> get_future() {
+        return Future<Arg...>(state_);
+    }
+
+    void make_ready() {
+        state_.conditional_call();
     }
 };
 
@@ -105,6 +210,9 @@ class IOService {
     uv_loop_t loop_;
     uv_idle_t idle_;
     std::atomic_bool stop_;
+    // task queue
+    mutable std::mutex mutex_;
+    //std::queue<std::packaged_task<void()>> tasks_;
 
     static void on_idle(uv_idle_t* idle) {
         IOService* io = static_cast<IOService*>(idle->data);
@@ -139,12 +247,18 @@ public:
     void close() {
         uv_loop_close(&loop_);
     }
+
+    template<class Fn>
+    Future<> post(Fn const& fn) {
+        throw "not implemented";
+    }
 };
 
 class File : std::enable_shared_from_this<File> {
     IOService& io_;
     uv_fs_t req_;
     uv_file fd_;
+
     Promise<aku_Status> open_promise_;
 
     static void on_open(uv_fs_t *req) {
@@ -395,6 +509,7 @@ void idle_cb(uv_idle_t* idle) {
 }
 
 int main() {
+    using namespace IO;
     std::cout << "Creating " << PATH << " file" << std::endl;
     try {
         init_file();
@@ -427,8 +542,6 @@ int main() {
         std::cout << "Done writing " << ((double)FSIZE/1024.0/1024.0) << "MB in "
                   << total.elapsed() << "s" << std::endl;
         check_file_content();
-        */
-        using namespace IO;
         IOService io;
         std::thread th([&]() {
             io.run();
@@ -436,6 +549,26 @@ int main() {
         File file(io);
         auto future = file.open(PATH, O_RDONLY);
         th.join();
+        */
+        /*
+        FutureState<int, std::string, double> tup;
+        tup.set(42, "hello", 3.14159);
+        auto fn = [](int a, std::string b, double c) {
+            std::cout << "a=" << a << ", b=" << b << ", c=" << c << std::endl;
+        };
+        tup.register_continuation(fn);
+        tup.call();
+        */
+        std::packaged_task<int(double)> task([](double val) {
+            std::cout << "val = " << val << std::endl;
+            return 42;
+        });
+        std::future<int> f = task.get_future();
+        TaskWrapper<double> func(std::move(task));
+        std::cout << "before call " << f.valid() << std::endl;
+        func(3.14159);
+        std::cout << "after call " << f.valid() << std::endl;
+        std::cout << "result     " << f.get() << std::endl;
     } catch (const std::exception& e) {
         std::cout << "error main " << e.what() << std::endl;
     }
